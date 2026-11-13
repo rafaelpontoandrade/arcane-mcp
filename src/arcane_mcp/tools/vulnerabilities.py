@@ -1,112 +1,86 @@
-"""Vulnerability scanning tools."""
+"""Environment-wide vulnerability tools (Arcane /environments/{id}/vulnerabilities)."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Annotated, Any
 
-import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
-from ..client import _build_headers, require_client
-from ..safety import ToolClass, compute_operation_hash, get_token_store
+from ..client import api, env_path, seg
+from ..safety import ToolClass
+from ._common import EnvId, Limit, Search, Start, make_tool, page
 
-logger = logging.getLogger(__name__)
+Severity = Annotated[str | None, Field(description="Comma-separated: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN")]
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def get_vulnerability_summary_all(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get vulnerability summary across all scanned images."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/vulnerabilities/summary"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    tool = make_tool(mcp, "vulnerabilities")
 
-    @mcp.tool()
-    async def list_all_vulnerabilities(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all vulnerabilities across the environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/vulnerabilities/all"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def get_vulnerability_overview(env_id: EnvId = None) -> Any:
+        """Environment-wide vulnerability overview (counts by severity, most affected images)."""
+        return await api("GET", f"{env_path(env_id)}/vulnerabilities/overview")
 
-    @mcp.tool()
-    async def ignore_vulnerability(urn: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Ignore a specific vulnerability by URN."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/vulnerabilities/ignore"
-        payload = {"urn": urn}
-        try:
-            resp = await client.post(url, json=payload, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def get_vulnerability_summary(env_id: EnvId = None) -> Any:
+        """Vulnerability counts by severity across all images of the environment."""
+        return await api("GET", f"{env_path(env_id)}/vulnerabilities/summary")
 
-    @mcp.tool()
-    async def list_ignored_vulnerabilities(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all ignored vulnerabilities."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/vulnerabilities/ignored"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def unignore_vulnerability(ignore_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Un-ignore a previously ignored vulnerability. Requires confirmation via confirmation_token."""
-        token = get_token_store().create(
-            action="unignore_vulnerability",
-            target=ignore_id,
-            endpoint=f"/api/environments/{env_id}/vulnerabilities/ignore/{ignore_id}",
-            method="DELETE",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+    @tool(ToolClass.READ)
+    async def list_vulnerabilities(
+        env_id: EnvId = None,
+        severity: Severity = "CRITICAL,HIGH",
+        image_name: str | None = None,
+        fix_available: bool | None = None,
+        include_ignored: bool = False,
+        search: Search = None,
+        start: Start = 0,
+        limit: Limit = 50,
+    ) -> Any:
+        """Paginated vulnerabilities across all images (default: CRITICAL and HIGH, not ignored)."""
+        return await api(
+            "GET",
+            f"{env_path(env_id)}/vulnerabilities/all",
+            params=page(
+                search,
+                start,
+                limit,
+                severity=severity,
+                imageName=image_name,
+                fixAvailable=fix_available,
+                ignored=include_ignored if include_ignored else None,
+            ),
         )
-        return {"warning": "Destructive operation. Call confirm_operation(token=...) to proceed.", "confirmation_token": token, "classification": ToolClass.DESTRUCTIVE_WRITE, "operation_hash": compute_operation_hash("unignore_vulnerability", ignore_id, None, None), "target": ignore_id, "action": "unignore_vulnerability"}
 
-    @mcp.tool()
-    async def get_scanner_status(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get vulnerability scanner (Trivy) status."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/vulnerabilities/scanner-status"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def get_scanner_status(env_id: EnvId = None) -> Any:
+        """Status of the vulnerability scanner (Trivy)."""
+        return await api("GET", f"{env_path(env_id)}/vulnerabilities/scanner-status")
+
+    @tool(ToolClass.READ)
+    async def list_ignored_vulnerabilities(env_id: EnvId = None, search: Search = None, start: Start = 0, limit: Limit = 50) -> Any:
+        """Vulnerabilities marked as ignored."""
+        return await api("GET", f"{env_path(env_id)}/vulnerabilities/ignored", params=page(search, start, limit))
+
+    @tool(ToolClass.WRITE)
+    async def ignore_vulnerability(
+        image_id: str,
+        vulnerability_id: Annotated[str, Field(description="e.g. CVE-2023-1234")],
+        pkg_name: str,
+        installed_version: str | None = None,
+        reason: str | None = None,
+        env_id: EnvId = None,
+    ) -> Any:
+        """Mark a vulnerability as ignored (false positive / accepted risk) for one image."""
+        body: dict[str, Any] = {"imageId": image_id, "vulnerabilityId": vulnerability_id, "pkgName": pkg_name}
+        if installed_version:
+            body["installedVersion"] = installed_version
+        if reason:
+            body["reason"] = reason
+        return await api("POST", f"{env_path(env_id)}/vulnerabilities/ignore", json_body=body)
+
+    @tool(ToolClass.WRITE)
+    async def unignore_vulnerability(ignore_id: str, env_id: EnvId = None) -> Any:
+        """Remove an ignore rule (the vulnerability is reported again)."""
+        return await api("DELETE", f"{env_path(env_id)}/vulnerabilities/ignore/{seg(ignore_id)}")

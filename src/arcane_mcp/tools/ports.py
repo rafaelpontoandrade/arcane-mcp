@@ -1,30 +1,20 @@
-"""Port mapping tools."""
+"""Published port listing."""
+
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-import httpx
 from fastmcp import FastMCP
 
-from ..client import _build_headers, require_client
-
-logger = logging.getLogger(__name__)
+from ..client import api, env_path
+from ..safety import ToolClass
+from ._common import EnvId, Limit, Search, Start, make_tool, page
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def list_ports(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all port mappings for the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/ports"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    tool = make_tool(mcp, "ports")
+
+    @tool(ToolClass.READ)
+    async def list_ports(env_id: EnvId = None, search: Search = None, start: Start = 0, limit: Limit = 100) -> Any:
+        """Host ports published by containers (useful to find conflicts before deploying)."""
+        return await api("GET", f"{env_path(env_id)}/ports", params=page(search, start, limit))

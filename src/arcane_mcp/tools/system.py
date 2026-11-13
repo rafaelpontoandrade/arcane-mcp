@@ -1,236 +1,164 @@
-"""System-level tools."""
+"""System tools: Docker info, health, Arcane version/upgrade, bulk container actions and prune."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Annotated, Any, Literal
 
-import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from pydantic import Field
 
-from ..client import _build_headers, require_client
-from ..safety import ToolClass, compute_operation_hash, get_token_store
-
-logger = logging.getLogger(__name__)
+from ..client import api, env_path
+from ..safety import ToolClass, propose
+from ._common import EnvId, make_tool, resolve_env
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def get_docker_info(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get Docker system information for the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/system/docker/info"
+    tool = make_tool(mcp, "system")
+
+    @tool(ToolClass.READ)
+    async def get_docker_info(env_id: EnvId = None) -> Any:
+        """Docker engine info (version, OS, CPUs, memory, container/image counts)."""
+        return await api("GET", f"{env_path(env_id)}/system/docker/info")
+
+    @tool(ToolClass.READ)
+    async def get_arcane_version(env_id: EnvId = None) -> Any:
+        """Arcane version of the server (and of the given environment's agent, if any)."""
+        app = await api("GET", "/api/version")
+        env = await api("GET", f"{env_path(env_id)}/version")
+        return {"server": app, "environment": env}
+
+    @tool(ToolClass.READ)
+    async def get_system_health(env_id: EnvId = None) -> Any:
+        """Health of the Arcane server and of the environment's Docker connection."""
+        server = await api("GET", "/api/health")
         try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+            await api("HEAD", f"{env_path(env_id)}/system/health")
+            env_ok: Any = True
+        except ToolError as e:
+            env_ok = {"healthy": False, "error": str(e)}
+        return {"server": server, "environment_healthy": env_ok}
 
-    @mcp.tool()
-    async def get_docker_version(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get Docker version for the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/version"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def get_dashboard(env_id: EnvId = None) -> Any:
+        """Arcane dashboard summary for an environment (counts, resource usage, alerts)."""
+        return await api("GET", f"{env_path(env_id)}/dashboard")
 
-    @mcp.tool()
-    async def prune_system(
-        containers: bool = True,
-        images: bool = True,
-        volumes: bool = False,
-        networks: bool = True,
-        build_cache: bool = False,
-        env_id: str = "0",
-        agent_token: str | None = None,
-        dry_run: bool = True,
-    ) -> Any:
-        """Prune system resources for the given environment. Select what to prune via flags (containers, images, volumes, networks, build_cache). Volumes default to False. Use dry_run=True (default) to preview what would be pruned without making changes."""
-        if dry_run:
-            return {
-                "dry_run": True,
-                "warning": "Dry-run. Set dry_run=False to proceed.",
-                "action": "prune_system",
-                "target": f"system:{env_id}",
-            }
-        token = get_token_store().create(
-            action="prune_system",
-            target=f"system:{env_id}",
-            endpoint=f"/api/environments/{env_id}/system/prune",
-            method="POST",
-            body={
-                "containers": containers,
-                "images": images,
-                "volumes": volumes,
-                "networks": networks,
-                "buildCache": build_cache,
-            },
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
-        )
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-            "operation_hash": compute_operation_hash(
-                "prune_system",
-                f"system:{env_id}",
-                {
-                    "containers": containers,
-                    "images": images,
-                    "volumes": volumes,
-                    "networks": networks,
-                    "buildCache": build_cache,
-                },
-                None,
-            ),
-            "target": f"system:{env_id}",
-            "action": "prune_system",
-        }
+    @tool(ToolClass.READ)
+    async def check_system_upgrade(env_id: EnvId = None) -> Any:
+        """Check whether a newer Arcane version is available."""
+        return await api("GET", f"{env_path(env_id)}/system/upgrade/check")
 
-    @mcp.tool()
-    async def get_system_health(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get system health metrics for the given environment."""
-        client = require_client()
-        url = "/api/health"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def convert_docker_run(docker_run_command: str, env_id: EnvId = None) -> Any:
+        """Convert a `docker run ...` command into an equivalent docker-compose service (no side effects)."""
+        return await api("POST", f"{env_path(env_id)}/system/convert", json_body={"dockerRunCommand": docker_run_command})
 
-    @mcp.tool()
-    async def check_system_upgrade(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Check if a system upgrade is available for the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/system/upgrade/check"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def start_all_containers(env_id: EnvId = None) -> Any:
+        """Start every container in the environment."""
+        return await api("POST", f"{env_path(env_id)}/system/containers/start-all")
 
-    @mcp.tool()
-    async def trigger_upgrade(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Trigger a system upgrade for the given environment."""
-        token = get_token_store().create(
-            action="trigger_upgrade",
-            target=f"system:{env_id}",
-            endpoint=f"/api/environments/{env_id}/system/upgrade",
-            method="POST",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
-        )
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-            "operation_hash": compute_operation_hash("trigger_upgrade", f"system:{env_id}", None, None),
-            "target": f"system:{env_id}",
-            "action": "trigger_upgrade",
-        }
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def start_stopped_containers(env_id: EnvId = None) -> Any:
+        """Start only the containers that are currently stopped."""
+        return await api("POST", f"{env_path(env_id)}/system/containers/start-stopped")
 
-    @mcp.tool()
-    async def start_all_containers(
-        env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Start all stopped containers for the given environment."""
-        token = get_token_store().create(
-            action="start_all_containers",
-            target=f"system:{env_id}",
-            endpoint=f"/api/environments/{env_id}/system/containers/start-all",
-            method="POST",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
-        )
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-            "operation_hash": compute_operation_hash("start_all_containers", f"system:{env_id}", None, None),
-            "target": f"system:{env_id}",
-            "action": "start_all_containers",
-        }
+    @tool(ToolClass.DESTRUCTIVE)
+    async def stop_all_containers(env_id: EnvId = None) -> Any:
+        """Propose stopping EVERY container in the environment. Requires confirm_operation."""
+        env = resolve_env(env_id)
 
-    @mcp.tool()
-    async def start_stopped_containers(
-        env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Start only containers that are currently stopped for the given environment."""
-        token = get_token_store().create(
-            action="start_stopped_containers",
-            target=f"system:{env_id}",
-            endpoint=f"/api/environments/{env_id}/system/containers/start-stopped",
-            method="POST",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
-        )
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-            "operation_hash": compute_operation_hash("start_stopped_containers", f"system:{env_id}", None, None),
-            "target": f"system:{env_id}",
-            "action": "start_stopped_containers",
-        }
+        async def run() -> Any:
+            return await api("POST", f"{env_path(env)}/system/containers/stop-all")
 
-    @mcp.tool()
-    async def stop_all_containers(
-        env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Stop all running containers for the given environment."""
-        token = get_token_store().create(
+        return propose(
             action="stop_all_containers",
-            target=f"system:{env_id}",
-            endpoint=f"/api/environments/{env_id}/system/containers/stop-all",
-            method="POST",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+            target=f"environment:{env}",
+            env_id=env,
+            args={},
+            executor=run,
+            summary=f"Stop ALL containers in environment {env} (every service goes down)",
         )
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-            "operation_hash": compute_operation_hash("stop_all_containers", f"system:{env_id}", None, None),
-            "target": f"system:{env_id}",
-            "action": "stop_all_containers",
+
+    @tool(ToolClass.DESTRUCTIVE)
+    async def trigger_upgrade(
+        target_version: Annotated[str | None, Field(description="Version to install (default: latest).")] = None,
+        env_id: EnvId = None,
+    ) -> Any:
+        """Propose upgrading Arcane itself (the server restarts). Requires confirm_operation."""
+        env = resolve_env(env_id)
+        check = await api("GET", f"{env_path(env)}/system/upgrade/check")
+        body = {"targetVersion": target_version} if target_version else None
+
+        async def run() -> Any:
+            return await api("POST", f"{env_path(env)}/system/upgrade", json_body=body)
+
+        return propose(
+            action="trigger_upgrade",
+            target=f"arcane:{env}",
+            env_id=env,
+            args=body or {},
+            executor=run,
+            summary=f"Upgrade Arcane to {target_version or 'the latest version'} (Arcane will restart)",
+            details={"upgrade_check": check},
+        )
+
+    @tool(ToolClass.DESTRUCTIVE)
+    async def prune_system(
+        containers: Literal["none", "stopped"] = "stopped",
+        images: Literal["none", "dangling", "all"] = "dangling",
+        volumes: Literal["none", "anonymous", "all"] = "none",
+        networks: Literal["none", "unused"] = "unused",
+        build_cache: Literal["none", "unused", "all"] = "none",
+        env_id: EnvId = None,
+    ) -> Any:
+        """Propose a system prune. Defaults are conservative: stopped containers, dangling images, unused networks.
+
+        volumes='all' deletes every unused named volume (DATA LOSS); images='all' deletes every unused image.
+        """
+        env = resolve_env(env_id)
+        body: dict[str, dict[str, str]] = {
+            "containers": {"mode": containers},
+            "images": {"mode": images},
+            "volumes": {"mode": volumes},
+            "networks": {"mode": networks},
+            "buildCache": {"mode": build_cache},
         }
+        preview: dict[str, Any] = {}
+        if containers == "stopped":
+            data = await api("GET", f"{env_path(env)}/containers", params={"start": 0, "limit": 500})
+            items = data.get("items", []) if isinstance(data, dict) else data or []
+            preview["stopped_containers"] = [
+                (c.get("names") or [c.get("name") or c.get("id")])[0]
+                for c in items
+                if isinstance(c, dict) and str(c.get("state", "")).lower() in ("exited", "created", "dead")
+            ][:100]
+        if volumes != "none":
+            data = await api("GET", f"{env_path(env)}/volumes", params={"inUse": False, "start": 0, "limit": 500})
+            items = data.get("items", []) if isinstance(data, dict) else data or []
+            preview["unused_volumes"] = [v.get("name") for v in items if isinstance(v, dict)][:100]
+        if images != "none":
+            data = await api("GET", f"{env_path(env)}/images", params={"inUse": False, "start": 0, "limit": 500})
+            items = data.get("items", []) if isinstance(data, dict) else data or []
+            preview["unused_images"] = [(i.get("repoTags") or ["<none>"])[0] for i in items if isinstance(i, dict)][:100]
+
+        async def run() -> Any:
+            return await api("POST", f"{env_path(env)}/system/prune", json_body=body)
+
+        danger = []
+        if volumes == "all":
+            danger.append("ALL unused named volumes will be deleted")
+        if images == "all":
+            danger.append("all unused images will be deleted")
+        return propose(
+            action="prune_system",
+            target=f"environment:{env}",
+            env_id=env,
+            args=body,
+            executor=run,
+            summary="System prune: "
+            + ", ".join(f"{k}={v['mode']}" for k, v in body.items())
+            + (f". WARNING: {'; '.join(danger)}" if danger else ""),
+            details={"preview": preview},
+        )

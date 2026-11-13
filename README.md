@@ -1,152 +1,141 @@
 # arcane-mcp
 
-An MCP server that exposes [Arcane](https://getarcane.app) Docker management capabilities to AI agents via the Model Context Protocol. Built with FastMCP.
+An MCP server that lets AI agents manage Docker through [Arcane](https://getarcane.app). Built with FastMCP.
 
-Covers the core Docker management API: containers, images, volumes, networks, Compose projects, registries, vulnerability scanning, port mappings, webhooks, system management, updater, activities/events, and environment management.
+Targets **Arcane v2.17.x**. Every request the tools make is checked in CI against the Arcane v2.17.3 route
+table (`tests/data/arcane-v2.17.3-routes.txt`), which was cross-checked against the live
+`/api/openapi.json` of a v2.17.3 instance (paths, query parameters and request body fields).
 
-**125 tools across 14 modules.**
+**126 tools: 123 in 13 modules plus 3 safety tools.** 60 are read-only (what remains with `ARCANE_MCP_READ_ONLY=true`).
 
 ## Install
 
-Not on PyPI. Install directly from GitHub:
-
 ```bash
-# pip
-pip install git+https://github.com/MikeCase/arcane-mcp.git
-
 # uv
-uv tool install git+https://github.com/MikeCase/arcane-mcp.git
+uv tool install git+https://github.com/rafaelpontoandrade/arcane-mcp.git
 
-# or clone and install locally
-git clone https://github.com/MikeCase/arcane-mcp.git
-cd arcane-mcp
-uv sync
+# pip
+pip install git+https://github.com/rafaelpontoandrade/arcane-mcp.git
 ```
 
 ## Configuration
 
-Set these environment variables (or put them in a `.env` file in the working directory):
+Environment variables (a `.env` in the working directory is also read). See `.env.example`.
 
-```env
-ARCANE_API_KEY=arc_your_api_key_here
-ARCANE_BASE_URL=http://localhost:3552
-```
+| Variable | Default | Purpose |
+|---|---|---|
+| `ARCANE_BASE_URL` | required | e.g. `http://10.0.0.10:3552` |
+| `ARCANE_API_KEY` | required | Arcane API key (sent as `X-API-Key`) |
+| `ARCANE_DEFAULT_ENV` | `0` | Environment used when a tool call omits `env_id` |
+| `ARCANE_TIMEOUT` | `30` | Seconds for normal requests |
+| `ARCANE_STREAM_TIMEOUT` | `600` | Seconds for pulls, deploys and redeploys |
+| `ARCANE_VERIFY_SSL` | `true` | `true`, `false`, or a path to a CA bundle (self-signed certs) |
+| `ARCANE_MCP_READ_ONLY` | `false` | Hide every tool that changes something |
+| `ARCANE_MCP_MODULES` | all | Comma-separated subset, e.g. `containers,projects,images` (fewer tools = less context used) |
+| `ARCANE_MCP_CONFIRM` | `auto` | How destructive operations are approved, see below |
+| `ARCANE_MCP_TOKEN_TTL` | `120` | Seconds a confirmation token stays valid |
+| `ARCANE_MCP_AUDIT_LOG` | `~/.arcane-mcp-audit.log` | JSON-lines audit log (created with mode 0600) |
 
-### OpenCode
-
-Add to your `opencode.json`:
+### Claude Code / Claude Desktop
 
 ```json
 {
-  "mcp": {
-    "arcane-docker": {
-      "type": "local",
-      "command": ["arcane-mcp"],
+  "mcpServers": {
+    "arcane": {
+      "command": "arcane-mcp",
       "env": {
-        "ARCANE_API_KEY": "arc_your_key_here",
-        "ARCANE_BASE_URL": "http://localhost:3552"
+        "ARCANE_BASE_URL": "http://10.0.0.10:3552",
+        "ARCANE_API_KEY": "arc_xxx",
+        "ARCANE_MCP_READ_ONLY": "true"
       }
     }
   }
 }
 ```
 
-Or set environment variables globally and omit them from the config.
+### OpenCode
 
-## Tools (125 total)
-
-### Containers (18)
-list_containers, inspect_container, create_container, start_container, stop_container, restart_container, kill_container, pause_container, unpause_container, remove_container, redeploy_container, commit_container, update_container, set_container_auto_update, exec_in_container, get_container_logs, get_container_stats, get_container_counts
-
-### Images (19)
-list_images, inspect_image, pull_image, remove_image, tag_image, prune_images, get_image_counts, build_image, search_images, upload_image, get_image_history, get_image_export, get_image_attestations, scan_image_vulnerabilities, get_image_vulnerabilities, get_vulnerability_summary, check_image_update, check_all_image_updates, get_image_update_summary
-
-### Volumes (18)
-list_volumes, create_volume, inspect_volume, remove_volume, prune_volumes, get_volume_counts, get_volume_sizes, get_volume_usage, list_volume_backups, create_volume_backup, restore_volume_backup, delete_volume_backup, download_volume_backup, browse_volume, read_volume_file, create_volume_directory, upload_to_volume, delete_volume_file
-
-### Projects / Compose (17)
-list_projects, get_project, deploy_project, redeploy_project, remove_project, update_project, get_project_counts, project_down, restart_project, build_project, archive_project, unarchive_project, pull_project_images, get_project_compose, get_project_file, update_project_services, get_project_runtime
-
-### Networks (9)
-list_networks, create_network, inspect_network, remove_network, connect_container_to_network, disconnect_container_from_network, prune_networks, get_network_counts, get_network_topology
-
-### Environments (5)
-list_environments, get_environment, create_environment, update_environment, remove_environment
-
-### System (9)
-get_docker_info, get_docker_version, prune_system, get_system_health, check_system_upgrade, trigger_upgrade, start_all_containers, start_stopped_containers, stop_all_containers
-
-### Activities & Events (7)
-list_activities, get_activity, cancel_activity, clear_activity_history, list_events, get_environment_events, delete_event
-
-### Container Registries (6)
-list_registries, create_registry, get_registry, update_registry, delete_registry, test_registry
-
-### Vulnerabilities (6)
-get_vulnerability_summary_all, list_all_vulnerabilities, ignore_vulnerability, list_ignored_vulnerabilities, unignore_vulnerability, get_scanner_status
-
-### Webhooks (5)
-trigger_webhook, list_webhooks, create_webhook, update_webhook, delete_webhook
-
-### Updater (3)
-run_updater, get_updater_status, get_updater_history
-
-### Ports (1)
-list_ports
-
-### Operations / Safety (2)
-confirm_operation, read_audit_log
-
-## Usage
-
-All resource tools accept `env_id: str = "0"` to target a specific Arcane environment (local Docker is "0", remote agents use UUIDs). Remote agent operations can pass `agent_token: str | None` for authentication via the `X-Arcane-Agent-Token` header.
-
-## Safety
-
-Destructive operations use a **three-layer safety system**:
-
-### 1. Confirmation tokens (two-step handshake)
-Every tool that removes, prunes, kills, restores, or overwrites returns a short-lived `confirmation_token` instead of executing. The agent must call `confirm_operation(token)` as a separate tool call to proceed. Tokens expire after 120 seconds.
-
-```
-remove_container("my-app")
-→ {"warning": "...", "confirmation_token": "a1b2c3d4e5f6", "target": "my-app"}
-
-confirm_operation(token="a1b2c3d4e5f6")
-→ {"success": true, ...}
+```json
+{
+  "mcp": {
+    "arcane": {
+      "type": "local",
+      "command": ["arcane-mcp"],
+      "environment": { "ARCANE_BASE_URL": "http://10.0.0.10:3552", "ARCANE_API_KEY": "arc_xxx" }
+    }
+  }
+}
 ```
 
-This prevents an agent from blasting through a safety gate in one call — it must stop, process the warning, and make a second call.
+## Safety model
 
-### 2. Dry-run mode (prune/cleanup tools)
-Prune operations (`prune_images`, `prune_volumes`, `prune_networks`, `prune_system`, `clear_activity_history`) default to `dry_run=True`, showing what would be affected without making changes:
+Tools are classified as **read**, **write** or **destructive**, and the class is published as MCP tool
+annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) so clients can ask for approval per tool.
 
-```
-prune_images()
-→ {"dry_run": true, "warning": "Dry-run. Set dry_run=False to proceed.", "target": "all"}
+**Destructive tools never act directly.** They return a summary, a preview where possible and a
+single-use `confirmation_token` with its `operation_hash`. Only `confirm_operation` executes the stored
+request. Examples of what the proposal contains:
 
-prune_images(dry_run=False)
-→ {"warning": "...", "confirmation_token": "..."}
-```
+- `prune_images`, `prune_networks`, `prune_volumes`, `prune_system`: the actual list of unused resources
+  that would be removed (Arcane has no prune dry-run, so the server lists them first).
+- `deploy_project`, `update_project`: a parsed compose plan with risk flags (`privileged`,
+  `network_mode: host`, Docker socket or `/etc`-style bind mounts, `cap_add`, devices...) and, for updates,
+  a unified diff against the current compose file.
+- `run_updater`: the result of a real updater dry run.
+- `remove_volume`: which containers still use the volume.
 
-### 3. Audit log
-Every confirmed destructive operation is recorded to a structured JSON-lines audit log. Read it anytime:
+**Who approves** depends on `ARCANE_MCP_CONFIRM`:
 
-```
-read_audit_log(lines=10)
-→ [{"timestamp": "2026-06-29T...", "action": "remove_container", "target": "my-app", "env_id": "0"}]
-```
+- `auto` (default): if the MCP client supports elicitation, `confirm_operation` asks the user directly
+  (Confirm / Cancel) and the agent cannot approve on its own. Otherwise the token flow alone applies.
+- `elicit`: always require the user's answer; refuse if the client cannot ask.
+- `token`: never ask; rely on the agent and on the client's own tool approval.
 
-Set `ARCANE_MCP_AUDIT_LOG` environment variable to change the log file path (default: `~/.arcane-mcp-audit.log`).
+**Audit log.** Each destructive operation writes `operation_proposed`, `operation_approved` (with
+`approved_by: user|agent`) and `operation_result`. Secret-looking fields are redacted and results are
+truncated. Read it with `read_audit_log`; see open proposals with `list_pending_operations`.
+
+**Secrets stay out of the chat when possible.** `create_registry`, `update_registry`,
+`create_environment`, `update_environment` and `trigger_webhook` accept `*_env` parameters naming an
+environment variable on the MCP host instead of the secret itself. Identifiers are URL-encoded, so a
+crafted ID cannot reach another endpoint.
+
+## Tools
+
+Destructive tools are marked with ⚠ (they need `confirm_operation`).
+
+- **Containers (17)**: list_containers (compact by default), get_container_counts, inspect_container, get_container_processes, get_container_logs, start/stop/restart/pause/unpause_container, set_container_auto_update, commit_container, create_container, ⚠ remove_container, ⚠ kill_container, ⚠ redeploy_container, ⚠ update_container
+- **Images (16)**: list_images, get_image_counts, inspect_image, get_image_history, get_image_attestations, search_images, pull_image, tag_image, scan_image_vulnerabilities, get_image_vulnerability_summary, list_image_vulnerabilities, check_image_update, check_all_image_updates, get_image_update_summary, ⚠ remove_image, ⚠ prune_images
+- **Projects / Compose (18)**: list_projects, get_project_counts, get_project, get_project_compose, get_project_runtime, get_project_updates, start_project, restart_project, pull_project_images, build_project, archive_project, unarchive_project, ⚠ deploy_project, ⚠ update_project, ⚠ redeploy_project, ⚠ update_project_services, ⚠ stop_project, ⚠ destroy_project
+- **Volumes (15)**: list_volumes, get_volume_counts, get_volume_sizes, inspect_volume, get_volume_usage, create_volume, browse_volume, read_volume_file, list_volume_backups, list_backup_files, create_volume_backup, ⚠ restore_volume_backup, ⚠ delete_volume_backup, ⚠ remove_volume, ⚠ prune_volumes
+- **Networks (9)**: list_networks, get_network_counts, get_network_topology, inspect_network, create_network, connect_container_to_network, disconnect_container_from_network, ⚠ remove_network, ⚠ prune_networks
+- **System (11)**: get_docker_info, get_arcane_version, get_system_health, get_dashboard, check_system_upgrade, convert_docker_run, start_all_containers, start_stopped_containers, ⚠ stop_all_containers, ⚠ trigger_upgrade, ⚠ prune_system
+- **Vulnerabilities (7)**: get_vulnerability_overview, get_vulnerability_summary, list_vulnerabilities, get_scanner_status, list_ignored_vulnerabilities, ignore_vulnerability, unignore_vulnerability
+- **Activities & events (7)**: list_activities, get_activity, cancel_activity, list_events, get_environment_events, ⚠ clear_activity_history, ⚠ delete_event
+- **Environments (6)**: list_environments, get_environment, test_environment, create_environment, update_environment, ⚠ remove_environment
+- **Registries (6)**: list_registries, get_registry, test_registry, create_registry, update_registry, ⚠ delete_registry
+- **Updater (5)**: get_updater_status, get_updater_history, check_project_updates, preview_updates, ⚠ run_updater
+- **Webhooks (5)**: list_webhooks, create_webhook, set_webhook_enabled, ⚠ delete_webhook, ⚠ trigger_webhook
+- **Ports (1)**: list_ports
+- **Safety (3)**: confirm_operation, list_pending_operations, read_audit_log
+
+List tools are paginated (`start`, `limit`, `search`) and return `{items, pagination}`; Arcane's own default
+page size is 20, so agents should look at `pagination.totalItems` before concluding anything.
+Long-running calls (`pull_image`, `start_project`, `redeploy_project`, `deploy_project`) wait for the
+progress stream to finish and return a short summary instead of thousands of progress lines.
 
 ## Development
 
 ```bash
-git clone https://github.com/MikeCase/arcane-mcp.git
-cd arcane-mcp
-uv sync
-uv run fastmcp run src/arcane_mcp/server.py
+uv sync --all-extras
+uv run pytest
+uv run ruff check src tests && uv run ruff format --check src tests
+uv run mypy src
+uv run fastmcp dev src/arcane_mcp/server.py   # inspector
 ```
+
+When targeting a new Arcane version, regenerate `tests/data/arcane-<version>-routes.txt` from the
+instance's `/api/openapi.json` (or from the backend source) and fix whatever `tests/test_routes.py` flags.
 
 ## License
 

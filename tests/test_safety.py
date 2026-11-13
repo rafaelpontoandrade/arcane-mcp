@@ -1,197 +1,124 @@
-"""Negative tests for the safety system — verifying what should FAIL does.
-
-These tests mock the HTTP client to avoid hitting a real Arcane instance.
-"""
-
 from __future__ import annotations
 
+import json
+import os
+import stat
 import time
-from unittest.mock import AsyncMock, patch
+from typing import Any
 
-import pytest
-
-from arcane_mcp.safety import (
-    ToolClass,
-    TokenStore,
-    compute_operation_hash,
-    compute_resource_hash,
-    get_audit_log,
-    get_token_store,
-)
+from arcane_mcp.config import Settings
+from arcane_mcp.safety import AuditLog, TokenStore, analyze_compose, redact
 
 
-# ── Fixtures ──
+async def _noop() -> Any:
+    return {"ok": True}
 
 
-@pytest.fixture
-def store() -> TokenStore:
-    """Fresh token store for each test."""
-    s = TokenStore()
-    # Reset module-level singleton so tests don't pollute each other
-    import arcane_mcp.safety as safety_mod
-    safety_mod._token_store = s
-    return s
+def _store_op(store: TokenStore, **kw: Any) -> Any:
+    args = {"action": "remove_container", "target": "c1", "env_id": "0", "args": {"force": True}, "executor": _noop, "summary": "s"}
+    args.update(kw)
+    return store.create(**args)
 
 
-# ── Negative tests ──
+def test_token_is_single_use(settings: Settings) -> None:
+    store = TokenStore()
+    op = _store_op(store)
+    got, _ = store.consume(op.token, op.operation_hash)
+    assert got is op
+    again, reason = store.consume(op.token, op.operation_hash)
+    assert again is None and reason
 
 
-class TestTokenRejection:
-    """Verify every way a token can be rejected."""
-
-    def test_token_reuse_fails(self, store: TokenStore) -> None:
-        """A consumed token cannot be consumed again."""
-        token = store.create(
-            action="remove_container", target="my-app",
-            endpoint="/containers/my-app", method="DELETE",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-        )
-        # First consume succeeds
-        assert store.consume(token) is not None
-        # Second consume fails
-        assert store.consume(token) is None
-
-    def test_token_for_wrong_operation_fails(self, store: TokenStore) -> None:
-        """Token for container A cannot confirm deletion of container B."""
-        token = store.create(
-            action="remove_container", target="container-a",
-            endpoint="/containers/container-a", method="DELETE",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-        )
-        # Correct hash for container B should not consume
-        wrong_hash = compute_operation_hash(
-            "remove_container", "container-b", None, None,
-        )
-        assert store.consume(token, operation_hash=wrong_hash) is None
-
-    def test_changed_arguments_invalidate_token(self, store: TokenStore) -> None:
-        """Token created with force=False cannot execute with force=True."""
-        token = store.create(
-            action="remove_container", target="my-app",
-            endpoint="/containers/my-app", method="DELETE",
-            params={"force": "false"},
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-        )
-        # Agent tries to confirm with different args
-        wrong_hash = compute_operation_hash(
-            "remove_container", "my-app", None, {"force": "true"},
-        )
-        assert store.consume(token, operation_hash=wrong_hash) is None
-
-    def test_expired_token_fails(self, store: TokenStore) -> None:
-        """An expired token does not execute."""
-        token = store.create(
-            action="remove_container", target="my-app",
-            endpoint="/containers/my-app", method="DELETE",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-        )
-        # Manually expire the token
-        store._tokens[token]["expires"] = time.time() - 1
-        assert store.consume(token) is None
-
-    def test_nonexistent_token_fails(self, store: TokenStore) -> None:
-        """A random token string is rejected."""
-        assert store.consume("this-token-never-existed") is None
-
-    def test_empty_token_fails(self, store: TokenStore) -> None:
-        """An empty token string is rejected."""
-        assert store.consume("") is None
+def test_hash_mismatch_does_not_burn_token(settings: Settings) -> None:
+    store = TokenStore()
+    op = _store_op(store)
+    bad, reason = store.consume(op.token, "0" * 16)
+    assert bad is None and "operation_hash" in str(reason)
+    good, _ = store.consume(op.token, op.operation_hash)
+    assert good is op
 
 
-class TestResourceChangeDetection:
-    """Verify resource change detection."""
-
-    def test_different_resource_hashes(self) -> None:
-        """Different resource states produce different hashes."""
-        h1 = compute_resource_hash({"id": "x", "status": "running"})
-        h2 = compute_resource_hash({"id": "x", "status": "stopped"})
-        assert h1 != h2
-
-    def test_same_resource_same_hash(self) -> None:
-        """Identical resource states produce the same hash."""
-        h1 = compute_resource_hash({"id": "x", "status": "running", "name": "test"})
-        h2 = compute_resource_hash({"name": "test", "status": "running", "id": "x"})
-        assert h1 == h2
-
-    def test_none_resource_hash(self) -> None:
-        """Operations with no resource state get None hash."""
-        assert compute_resource_hash(None) is None
+def test_token_expires(settings: Settings) -> None:
+    store = TokenStore()
+    op = _store_op(store, ttl=0)
+    time.sleep(0.01)
+    got, reason = store.consume(op.token)
+    assert got is None and "expired" in str(reason)
 
 
-class TestDryRunSafety:
-    """Verify dry-run cannot be upgraded to execute."""
-
-    def test_dry_run_returns_no_token(self) -> None:
-        """Dry-run mode returns a dry_run flag, not a token."""
-        # This test validates the pattern used in tool files:
-        # in prune tools, dry_run=True returns early without creating a token
-        from arcane_mcp.tools.images import register as images_register
-        from arcane_mcp.tools.volumes import register as volumes_register
-        from arcane_mcp.tools.networks import register as networks_register
-        # All three have dry_run pattern — compile check is sufficient
-        assert True
+def test_hash_depends_on_arguments(settings: Settings) -> None:
+    store = TokenStore()
+    a = _store_op(store, args={"force": True})
+    b = _store_op(store, args={"force": False})
+    c = _store_op(store, target="c2")
+    assert len({a.operation_hash, b.operation_hash, c.operation_hash}) == 3
 
 
-class TestAuditLog:
-    """Verify audit log structure."""
-
-    def test_audit_log_three_events(self, tmp_path) -> None:
-        """Three audit events (proposed, approved, result) form a complete trail."""
-        log_path = tmp_path / "test-audit.log"
-        audit = __import__("arcane_mcp.safety", fromlist=["AuditLog"]).AuditLog(str(log_path))
-
-        audit.log_proposed(
-            token="tok1", action="remove_container", target="my-app",
-        )
-        audit.log_approved(
-            token="tok1", action="remove_container", target="my-app",
-        )
-        audit.log_result(
-            token="tok1", action="remove_container", target="my-app",
-            success=True, result={"status": "removed"},
-        )
-
-        entries = audit.read_lines(10)
-        assert len(entries) == 3
-        assert entries[0]["event"] == "operation_proposed"
-        assert entries[1]["event"] == "operation_approved"
-        assert entries[2]["event"] == "operation_result"
-        assert entries[2]["success"] is True
+def test_audit_log_permissions_and_redaction(settings: Settings, tmp_path: Any) -> None:
+    path = str(tmp_path / "sub" / "audit.log")
+    log = AuditLog(path)
+    store = TokenStore()
+    op = _store_op(store, args={"token": "supersecret", "name": "x"})
+    log.proposed(op)
+    log.approved(op, "user")
+    log.result(op, success=True, result={"password": "p", "big": "x" * 5000})
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode == 0o600
+    raw = open(path).read()
+    assert "supersecret" not in raw and '"p"' not in raw
+    events = [json.loads(line)["event"] for line in raw.splitlines()]
+    assert events == ["operation_proposed", "operation_approved", "operation_result"]
+    assert log.read_lines(1)[0]["result"]["truncated"] is True
+    assert "token" not in json.loads(raw.splitlines()[0])  # only a short token_id is logged
 
 
-class TestClassification:
-    """Verify tool classification labels."""
-
-    def test_classification_labels_exist(self) -> None:
-        """Every ToolClass has a human-readable label."""
-        from arcane_mcp.safety import CLASSIFICATION_LABELS
-        for cls in ToolClass:
-            assert cls in CLASSIFICATION_LABELS
-            assert CLASSIFICATION_LABELS[cls]
+def test_redact_nested() -> None:
+    assert redact({"a": {"apiKey": "k", "x": [{"secret": "s"}]}}) == {"a": {"apiKey": "***", "x": [{"secret": "***"}]}}
 
 
-class TestTokenPeek:
-    """Verify peek does not consume."""
+def test_analyze_compose_reads_indented_services() -> None:
+    plan = analyze_compose(
+        """
+services:
+  web:
+    image: nginx:1.27
+    ports: ["8080:80"]
+  db:
+    image: postgres:16
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+volumes:
+  dbdata:
+"""
+    )
+    assert plan["valid"] is True
+    assert [s["name"] for s in plan["services"]] == ["web", "db"]
+    assert plan["services"][0]["image"] == "nginx:1.27"
+    assert plan["risk_flags"] == []
 
-    def test_peek_does_not_consume(self, store: TokenStore) -> None:
-        """peek() returns token info without removing it."""
-        token = store.create(
-            action="remove_container", target="my-app",
-            endpoint="/containers/my-app", method="DELETE",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-        )
-        info = store.peek(token)
-        assert info is not None
-        assert info["action"] == "remove_container"
-        # Token is still in store
-        assert store.consume(token) is not None
 
-    def test_peek_expired(self, store: TokenStore) -> None:
-        """peek() returns None for expired tokens."""
-        token = store.create(
-            action="test", target="x",
-            endpoint="/x", method="GET",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-        )
-        store._tokens[token]["expires"] = time.time() - 1
-        assert store.peek(token) is None
+def test_analyze_compose_flags_risky_settings() -> None:
+    plan = analyze_compose(
+        """
+services:
+  agent:
+    image: x
+    privileged: true
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host:ro
+      - ./data:/data
+    cap_add: [SYS_ADMIN]
+"""
+    )
+    flags = " ".join(plan["risk_flags"])
+    assert plan["risk_level"] == "high"
+    for needle in ("privileged", "network_mode: host", "docker.sock", "sensitive host path /", "cap_add"):
+        assert needle in flags
+    assert "./data" not in flags
+
+
+def test_analyze_compose_invalid() -> None:
+    assert analyze_compose("services: [")["valid"] is False
+    assert analyze_compose("version: '3'")["valid"] is False

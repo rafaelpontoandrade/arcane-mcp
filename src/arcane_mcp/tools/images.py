@@ -1,359 +1,167 @@
-"""Image management tools."""
+"""Image tools (Arcane /environments/{id}/images and /image-updates)."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Annotated, Any, Literal
 
-import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
-from ..client import _build_headers, require_client
-from ..safety import ToolClass, compute_operation_hash, get_token_store
+from ..client import api, api_stream, env_path, seg
+from ..safety import ToolClass, propose
+from ._common import EnvId, Limit, Search, Start, make_tool, page, resolve_env
 
-logger = logging.getLogger(__name__)
+
+async def _unused_images(env: str) -> list[dict[str, Any]]:
+    data = await api("GET", f"{env_path(env)}/images", params={"inUse": False, "start": 0, "limit": 500})
+    items = data.get("items", []) if isinstance(data, dict) else data or []
+    return [
+        {"id": str(i.get("id", ""))[:19], "tags": i.get("repoTags") or ["<none>"], "size": i.get("size")}
+        for i in items
+        if isinstance(i, dict)
+    ]
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def list_images(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all images in the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    tool = make_tool(mcp, "images")
 
-    @mcp.tool()
-    async def pull_image(repository: str, tag: str = "latest", env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Pull image from registry into environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/pull"
-        body = {"repository": repository, "tag": tag}
-        try:
-            resp = await client.post(url, json=body, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def remove_image(
-        image_id: str, force: bool = False, env_id: str = "0",
-        agent_token: str | None = None,
+    @tool(ToolClass.READ)
+    async def list_images(
+        env_id: EnvId = None,
+        search: Search = None,
+        start: Start = 0,
+        limit: Limit = 50,
+        in_use: Annotated[bool | None, Field(description="Filter by whether a container uses the image.")] = None,
+        has_updates: Annotated[bool | None, Field(description="Only images with an available update.")] = None,
     ) -> Any:
-        """Remove image by id. Requires confirmation token to execute."""
-        token = get_token_store().create(
+        """List images with pagination."""
+        return await api("GET", f"{env_path(env_id)}/images", params=page(search, start, limit, inUse=in_use, updates=has_updates))
+
+    @tool(ToolClass.READ)
+    async def get_image_counts(env_id: EnvId = None) -> Any:
+        """Image counts (total, in use, unused, total size)."""
+        return await api("GET", f"{env_path(env_id)}/images/counts")
+
+    @tool(ToolClass.READ)
+    async def inspect_image(image_id: str, env_id: EnvId = None) -> Any:
+        """Details of one image."""
+        return await api("GET", f"{env_path(env_id)}/images/{seg(image_id)}")
+
+    @tool(ToolClass.READ)
+    async def get_image_history(image: str, env_id: EnvId = None) -> Any:
+        """Layer history of an image (ID or name:tag)."""
+        return await api("GET", f"{env_path(env_id)}/images/{seg(image)}/history")
+
+    @tool(ToolClass.READ)
+    async def get_image_attestations(image: str, env_id: EnvId = None) -> Any:
+        """Supply-chain attestations (SBOM/provenance) of an image."""
+        return await api("GET", f"{env_path(env_id)}/images/{seg(image)}/attestations")
+
+    @tool(ToolClass.READ)
+    async def search_images(term: str, env_id: EnvId = None) -> Any:
+        """Search Docker Hub for images."""
+        return await api("GET", f"{env_path(env_id)}/images/search", params={"term": term})
+
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def pull_image(
+        image: Annotated[str, Field(description="Image name, e.g. 'nginx' or 'ghcr.io/org/app'.")],
+        tag: str = "latest",
+        env_id: EnvId = None,
+    ) -> Any:
+        """Pull an image. Waits for the pull to finish and returns a short summary of the output."""
+        return await api_stream("POST", f"{env_path(env_id)}/images/pull", json_body={"imageName": image, "tag": tag})
+
+    @tool(ToolClass.WRITE)
+    async def tag_image(image: str, repository: str, tag: str = "latest", env_id: EnvId = None) -> Any:
+        """Add a tag (repository:tag) to an existing image."""
+        return await api("POST", f"{env_path(env_id)}/images/{seg(image)}/tag", json_body={"repository": repository, "tag": tag})
+
+    # ── Vulnerabilities per image ──
+
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def scan_image_vulnerabilities(image_id: str, env_id: EnvId = None) -> Any:
+        """Start a vulnerability scan (Trivy) of an image."""
+        return await api("POST", f"{env_path(env_id)}/images/{seg(image_id)}/vulnerabilities/scan")
+
+    @tool(ToolClass.READ)
+    async def get_image_vulnerability_summary(image_id: str, env_id: EnvId = None) -> Any:
+        """Vulnerability counts by severity for one image."""
+        return await api("GET", f"{env_path(env_id)}/images/{seg(image_id)}/vulnerabilities/summary")
+
+    @tool(ToolClass.READ)
+    async def list_image_vulnerabilities(
+        image_id: str,
+        env_id: EnvId = None,
+        severity: Annotated[str | None, Field(description="Comma-separated: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN")] = None,
+        search: Search = None,
+        start: Start = 0,
+        limit: Limit = 50,
+    ) -> Any:
+        """Paginated vulnerabilities of one image."""
+        return await api(
+            "GET",
+            f"{env_path(env_id)}/images/{seg(image_id)}/vulnerabilities/list",
+            params=page(search, start, limit, severity=severity),
+        )
+
+    # ── Updates ──
+
+    @tool(ToolClass.READ)
+    async def check_image_update(image_ref: str, env_id: EnvId = None) -> Any:
+        """Check whether a newer version exists for an image reference (e.g. 'nginx:latest')."""
+        return await api("GET", f"{env_path(env_id)}/image-updates/check", params={"imageRef": image_ref})
+
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def check_all_image_updates(env_id: EnvId = None) -> Any:
+        """Check every image in the environment for updates (refreshes Arcane's update cache)."""
+        return await api("POST", f"{env_path(env_id)}/image-updates/check-all", json_body={})
+
+    @tool(ToolClass.READ)
+    async def get_image_update_summary(env_id: EnvId = None) -> Any:
+        """Summary of images with pending updates."""
+        return await api("GET", f"{env_path(env_id)}/image-updates/summary")
+
+    # ── Destructive ──
+
+    @tool(ToolClass.DESTRUCTIVE)
+    async def remove_image(image_id: str, force: bool = False, env_id: EnvId = None) -> Any:
+        """Propose removing an image. Requires confirm_operation."""
+        env = resolve_env(env_id)
+
+        async def run() -> Any:
+            return await api("DELETE", f"{env_path(env)}/images/{seg(image_id)}", params={"force": force})
+
+        return propose(
             action="remove_image",
             target=image_id,
-            endpoint=f"/api/environments/{env_id}/images/{image_id}",
-            method="DELETE",
-            body={"force": str(force).lower()},
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+            env_id=env,
+            args={"force": force},
+            executor=run,
+            summary=f"Remove image {image_id}" + (" (force)" if force else ""),
         )
-        op_hash = compute_operation_hash("remove_image", image_id, {"force": str(force).lower()}, None)
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": image_id,
-            "action": "remove_image",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
 
-    @mcp.tool()
-    async def inspect_image(image_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Inspect image by id."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{image_id}"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.DESTRUCTIVE)
+    async def prune_images(
+        mode: Annotated[
+            Literal["dangling", "all"],
+            Field(description="'dangling' removes untagged images only; 'all' removes every image not used by a container."),
+        ] = "dangling",
+        env_id: EnvId = None,
+    ) -> Any:
+        """Propose pruning images. Returns a preview of unused images plus a confirmation token."""
+        env = resolve_env(env_id)
+        unused = await _unused_images(env)
+        candidates = [i for i in unused if mode == "all" or i["tags"] in (["<none>"], ["<none>:<none>"])]
 
-    @mcp.tool()
-    async def tag_image(source: str, target: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Tag an existing image with a new repository name."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{source}/tag"
-        body = {"repo": target}
-        try:
-            resp = await client.post(url, json=body, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+        async def run() -> Any:
+            return await api("POST", f"{env_path(env)}/images/prune", json_body={"mode": mode})
 
-    @mcp.tool()
-    async def prune_images(env_id: str = "0", dry_run: bool = True, agent_token: str | None = None) -> Any:
-        """Prune unused Docker images. Destructive; use dry_run=False and confirmation token to execute.
-
-        When dry_run=True (default), returns a dry-run warning without creating a
-        confirmation token. Set dry_run=False to get a confirmation token for execution.
-        """
-        if dry_run:
-            return {
-                "dry_run": True,
-                "warning": "Dry-run. Set dry_run=False and confirm to execute.",
-                "action": "prune_images",
-                "target": "all",
-            }
-        token = get_token_store().create(
+        return propose(
             action="prune_images",
-            target="all",
-            endpoint=f"/api/environments/{env_id}/images/prune",
-            method="POST",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+            target=f"images:{mode}",
+            env_id=env,
+            args={"mode": mode},
+            executor=run,
+            summary=f"Prune {mode} images: about {len(candidates)} image(s) would be removed",
+            details={"preview": candidates[:100], "preview_count": len(candidates)},
         )
-        op_hash = compute_operation_hash("prune_images", "all", None, None)
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": "all",
-            "action": "prune_images",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
-
-    @mcp.tool()
-    async def get_image_counts(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get image count statistics for the environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/counts"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def build_image(dockerfile_content: str, tag: str = "latest", env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Build an image from Dockerfile content."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/build"
-        body = {"dockerfile": dockerfile_content, "tag": tag}
-        try:
-            resp = await client.post(url, json=body, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def search_images(query: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Search images by name/query in the environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/search"
-        params = {"query": query}
-        try:
-            resp = await client.get(url, params=params, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def upload_image(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Upload an image to the environment.
-
-        Note: This tool calls the upload endpoint but does NOT handle
-        multipart file uploads. Use a direct API client (curl, Postman)
-        with a multipart/form-data request for actual file uploads.
-        """
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/upload"
-        try:
-            resp = await client.post(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def get_image_history(image_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get the build history for an image."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{image_id}/history"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def get_image_export(name: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Export an image by name (download its tar archive)."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{name}/export"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def get_image_attestations(name: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get attestations for an image."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{name}/attestations"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def scan_image_vulnerabilities(image_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Trigger a vulnerability scan on an image."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{image_id}/vulnerabilities/scan"
-        try:
-            resp = await client.post(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def get_image_vulnerabilities(image_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get vulnerability report for an image."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{image_id}/vulnerabilities"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def get_vulnerability_summary(image_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get a summary of vulnerabilities for an image."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/images/{image_id}/vulnerabilities/summary"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def check_image_update(reference: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Check if a newer version of an image is available by reference."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/image-updates/check"
-        params = {"reference": reference}
-        try:
-            resp = await client.get(url, params=params, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def check_all_image_updates(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Check for updates on all images in the environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/image-updates/check-all"
-        try:
-            resp = await client.post(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def get_image_update_summary(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get a summary of available image updates."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/image-updates/summary"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}

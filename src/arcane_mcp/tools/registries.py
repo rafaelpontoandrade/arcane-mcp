@@ -1,123 +1,105 @@
-"""Container registry management tools."""
+"""Container registry credential tools (Arcane /container-registries)."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Annotated, Any
 
-import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
-from ..client import _build_headers, require_client
-from ..safety import ToolClass, compute_operation_hash, get_token_store
+from ..client import api, seg
+from ..safety import ToolClass, propose
+from ._common import Limit, Search, Start, make_tool, page, secret_value
 
-logger = logging.getLogger(__name__)
+TokenEnv = Annotated[
+    str | None,
+    Field(description="Name of an env var on the MCP server holding the password/token (keeps it out of the chat)."),
+]
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def list_registries(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all container registries."""
-        client = require_client()
-        url = "/api/container-registries"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    tool = make_tool(mcp, "registries")
 
-    @mcp.tool()
-    async def create_registry(name: str, url: str, username: str = "", password: str = "", env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Create a new container registry."""
-        client = require_client()
-        url_path = "/api/container-registries"
-        payload = {"name": name, "url": url, "username": username, "password": password}
-        try:
-            resp = await client.post(url_path, json=payload, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url_path, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url_path)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def list_registries(search: Search = None, start: Start = 0, limit: Limit = 50) -> Any:
+        """List configured container registries (credentials are not returned)."""
+        return await api("GET", "/api/container-registries", params=page(search, start, limit))
 
-    @mcp.tool()
-    async def get_registry(registry_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get a container registry by ID."""
-        client = require_client()
-        url = f"/api/container-registries/{registry_id}"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def get_registry(registry_id: str) -> Any:
+        """Details of one registry."""
+        return await api("GET", f"/api/container-registries/{seg(registry_id)}")
 
-    @mcp.tool()
-    async def update_registry(registry_id: str, name: str | None = None, url: str | None = None, username: str | None = None, password: str | None = None, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Update a container registry."""
-        client = require_client()
-        url_path = f"/api/container-registries/{registry_id}"
-        payload: dict[str, Any] = {}
-        if name is not None:
-            payload["name"] = name
-        if url is not None:
-            payload["url"] = url
-        if username is not None:
-            payload["username"] = username
-        if password is not None:
-            payload["password"] = password
-        if not payload:
-            return {"warning": "No update payload provided."}
-        try:
-            resp = await client.put(url_path, json=payload, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url_path, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url_path)
-            return {"error": str(e)}
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def test_registry(registry_id: str) -> Any:
+        """Test the stored credentials against the registry."""
+        return await api("POST", f"/api/container-registries/{seg(registry_id)}/test")
 
-    @mcp.tool()
-    async def delete_registry(registry_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Delete a container registry. Requires confirmation via confirmation_token."""
-        token = get_token_store().create(
+    @tool(ToolClass.WRITE)
+    async def create_registry(
+        url: str,
+        username: str = "",
+        token: Annotated[str | None, Field(description="Password or access token. Prefer token_env.")] = None,
+        token_env: TokenEnv = None,
+        description: str | None = None,
+        insecure: bool = False,
+    ) -> Any:
+        """Add registry credentials (e.g. ghcr.io, Docker Hub)."""
+        body: dict[str, Any] = {
+            "url": url,
+            "username": username,
+            "token": secret_value(token, token_env, "registry token") or "",
+            "description": description,
+            "insecure": insecure,
+            "enabled": True,
+            "registryType": "generic",
+            "repositoryNames": None,
+            "awsAccessKeyId": "",
+            "awsSecretAccessKey": "",
+            "awsRegion": "",
+        }
+        return await api("POST", "/api/container-registries", json_body=body)
+
+    @tool(ToolClass.WRITE)
+    async def update_registry(
+        registry_id: str,
+        url: str | None = None,
+        username: str | None = None,
+        token: Annotated[str | None, Field(description="Prefer token_env.")] = None,
+        token_env: TokenEnv = None,
+        description: str | None = None,
+        insecure: bool | None = None,
+        enabled: bool | None = None,
+    ) -> Any:
+        """Update registry settings or credentials (only the fields given; the others are kept)."""
+        # Arcane's schema lists every field as required but nullable: null means "keep current value".
+        body: dict[str, Any] = {
+            "url": url,
+            "username": username,
+            "token": secret_value(token, token_env, "registry token"),
+            "description": description,
+            "insecure": insecure,
+            "enabled": enabled,
+            "registryType": None,
+            "repositoryNames": None,
+            "awsAccessKeyId": None,
+            "awsSecretAccessKey": None,
+            "awsRegion": None,
+        }
+        return await api("PUT", f"/api/container-registries/{seg(registry_id)}", json_body=body)
+
+    @tool(ToolClass.DESTRUCTIVE)
+    async def delete_registry(registry_id: str) -> Any:
+        """Propose deleting registry credentials. Requires confirm_operation."""
+
+        async def run() -> Any:
+            return await api("DELETE", f"/api/container-registries/{seg(registry_id)}")
+
+        return propose(
             action="delete_registry",
-            target=registry_id,
-            endpoint=f"/api/container-registries/{registry_id}",
-            method="DELETE",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+            target=f"registry:{registry_id}",
+            env_id="-",
+            args={},
+            executor=run,
+            summary=f"Delete registry credentials {registry_id}",
         )
-        return {"warning": "Destructive operation. Call confirm_operation(token=...) to proceed.", "confirmation_token": token, "classification": ToolClass.DESTRUCTIVE_WRITE, "operation_hash": compute_operation_hash("delete_registry", registry_id, None, None), "target": registry_id, "action": "delete_registry"}
-
-    @mcp.tool()
-    async def test_registry(registry_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Test connectivity to a container registry."""
-        client = require_client()
-        url = f"/api/container-registries/{registry_id}/test"
-        try:
-            resp = await client.post(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}

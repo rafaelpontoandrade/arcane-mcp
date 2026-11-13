@@ -1,108 +1,97 @@
-"""Environment management tools."""
+"""Environment tools (Arcane /environments): local Docker and remote agents."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Annotated, Any
 
-import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
-from ..client import require_client
-from ..safety import ToolClass, compute_operation_hash, get_token_store
+from ..client import api, seg
+from ..safety import ToolClass, propose
+from ._common import Limit, Search, Start, make_tool, page, secret_value
 
-logger = logging.getLogger(__name__)
+TokenEnv = Annotated[
+    str | None,
+    Field(description="Name of an env var on the MCP server holding the access token (keeps it out of the chat)."),
+]
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def list_environments() -> Any:
-        """List all environments (local + remote agents)."""
-        client = require_client()
-        url = "/api/environments"
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    tool = make_tool(mcp, "environments")
 
-    @mcp.tool()
+    @tool(ToolClass.READ)
+    async def list_environments(search: Search = None, start: Start = 0, limit: Limit = 50) -> Any:
+        """List Arcane environments (ID '0' is the local Docker host)."""
+        return await api("GET", "/api/environments", params=page(search, start, limit))
+
+    @tool(ToolClass.READ)
     async def get_environment(env_id: str) -> Any:
-        """Get details of a specific environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}"
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            result = resp.json()
-            return {
-                "classification": ToolClass.CREDENTIAL_SENSITIVE,
-                "warning": "This response may contain sensitive data (env vars, secrets, config). Handle with care.",
-                "data": result,
-            }
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+        """Details of one environment."""
+        return await api("GET", f"/api/environments/{seg(env_id)}")
 
-    @mcp.tool()
-    async def create_environment(name: str, api_url: str, agent_token: str) -> Any:
-        """Register a new remote agent environment."""
-        client = require_client()
-        url = "/api/environments"
-        payload = {"name": name, "apiUrl": api_url, "accessToken": agent_token}
-        try:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.WRITE, idempotent=True)
+    async def test_environment(env_id: str) -> Any:
+        """Test connectivity to an environment's Docker/agent."""
+        return await api("POST", f"/api/environments/{seg(env_id)}/test")
 
-    @mcp.tool()
-    async def update_environment(env_id: str, name: str | None = None, api_url: str | None = None, agent_token: str | None = None) -> Any:
-        """Update environment settings (name, API URL, or access token)."""
-        client = require_client()
-        url = f"/api/environments/{env_id}"
-        payload: dict[str, Any] = {}
+    @tool(ToolClass.WRITE)
+    async def create_environment(
+        api_url: str,
+        name: str | None = None,
+        access_token: Annotated[str | None, Field(description="Prefer access_token_env.")] = None,
+        access_token_env: TokenEnv = None,
+        enabled: bool = True,
+    ) -> Any:
+        """Register a remote environment (Arcane agent)."""
+        body: dict[str, Any] = {"apiUrl": api_url, "enabled": enabled}
+        if name:
+            body["name"] = name
+        token = secret_value(access_token, access_token_env, "access token")
+        if token:
+            body["accessToken"] = token
+        return await api("POST", "/api/environments", json_body=body)
+
+    @tool(ToolClass.WRITE)
+    async def update_environment(
+        env_id: str,
+        name: str | None = None,
+        api_url: str | None = None,
+        enabled: bool | None = None,
+        access_token: Annotated[str | None, Field(description="Prefer access_token_env.")] = None,
+        access_token_env: TokenEnv = None,
+    ) -> Any:
+        """Update an environment's name, URL, enabled flag or access token."""
+        body: dict[str, Any] = {}
         if name is not None:
-            payload["name"] = name
+            body["name"] = name
         if api_url is not None:
-            payload["apiUrl"] = api_url
-        if agent_token is not None:
-            payload["accessToken"] = agent_token
-        try:
-            resp = await client.put(url, json=payload)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+            body["apiUrl"] = api_url
+        if enabled is not None:
+            body["enabled"] = enabled
+        token = secret_value(access_token, access_token_env, "access token")
+        if token:
+            body["accessToken"] = token
+        return await api("PUT", f"/api/environments/{seg(env_id)}", json_body=body)
 
-    @mcp.tool()
+    @tool(ToolClass.DESTRUCTIVE)
     async def remove_environment(env_id: str) -> Any:
-        """Remove an environment. Requires confirmation via confirmation_token."""
-        token = get_token_store().create(
+        """Propose removing an environment from Arcane (containers on it are not touched)."""
+        if env_id == "0":
+            from fastmcp.exceptions import ToolError
+
+            raise ToolError("Refusing to remove the local environment '0'.")
+        info = await api("GET", f"/api/environments/{seg(env_id)}")
+
+        async def run() -> Any:
+            return await api("DELETE", f"/api/environments/{seg(env_id)}")
+
+        name = info.get("name") if isinstance(info, dict) else None
+        return propose(
             action="remove_environment",
-            target=env_id,
-            endpoint=f"/api/environments/{env_id}",
-            method="DELETE",
-            body=None,
-            params=None,
-            classification=ToolClass.DESTRUCTIVE_WRITE,
+            target=f"environment:{env_id}",
             env_id=env_id,
-            agent_token=None,
+            args={},
+            executor=run,
+            summary=f"Remove environment {name or env_id} from Arcane",
         )
-        return {"warning": "Destructive operation. Call confirm_operation(token=...) to proceed.", "confirmation_token": token, "classification": ToolClass.DESTRUCTIVE_WRITE, "operation_hash": compute_operation_hash("remove_environment", env_id, None, None), "target": env_id, "action": "remove_environment"}

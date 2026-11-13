@@ -1,387 +1,181 @@
-"""Volume management tools."""
+"""Volume tools (Arcane /environments/{id}/volumes), including backups and read-only file browsing."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Annotated, Any
 
-import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
-from ..client import _build_headers, require_client
-from ..safety import ToolClass, compute_operation_hash, get_token_store
+from ..client import api, env_path, seg
+from ..safety import ToolClass, propose
+from ._common import EnvId, Limit, Search, Start, make_tool, page, resolve_env
 
-logger = logging.getLogger(__name__)
+MAX_TREE_ENTRIES = 500
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
-    async def list_volumes(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all volumes in the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    tool = make_tool(mcp, "volumes")
 
-    @mcp.tool()
-    async def create_volume(
-        name: str, driver: str = "local", labels: str | None = None,
-        env_id: str = "0", agent_token: str | None = None,
+    @tool(ToolClass.READ)
+    async def list_volumes(
+        env_id: EnvId = None,
+        search: Search = None,
+        start: Start = 0,
+        limit: Limit = 50,
+        in_use: bool | None = None,
+        include_internal: bool = False,
     ) -> Any:
-        """Create a new volume in the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes"
+        """List volumes with pagination."""
+        return await api(
+            "GET",
+            f"{env_path(env_id)}/volumes",
+            params=page(search, start, limit, inUse=in_use, includeInternal=include_internal),
+        )
+
+    @tool(ToolClass.READ)
+    async def get_volume_counts(env_id: EnvId = None) -> Any:
+        """Volume counts (total, in use, unused)."""
+        return await api("GET", f"{env_path(env_id)}/volumes/counts")
+
+    @tool(ToolClass.READ)
+    async def get_volume_sizes(env_id: EnvId = None) -> Any:
+        """Disk usage of every volume (can be slow on large hosts)."""
+        return await api("GET", f"{env_path(env_id)}/volumes/sizes")
+
+    @tool(ToolClass.READ)
+    async def inspect_volume(name: str, env_id: EnvId = None) -> Any:
+        """Details of one volume."""
+        return await api("GET", f"{env_path(env_id)}/volumes/{seg(name)}")
+
+    @tool(ToolClass.READ)
+    async def get_volume_usage(name: str, env_id: EnvId = None) -> Any:
+        """Which containers use a volume."""
+        return await api("GET", f"{env_path(env_id)}/volumes/{seg(name)}/usage")
+
+    @tool(ToolClass.WRITE)
+    async def create_volume(
+        name: str,
+        driver: str = "local",
+        labels: dict[str, str] | None = None,
+        driver_opts: dict[str, str] | None = None,
+        env_id: EnvId = None,
+    ) -> Any:
+        """Create a volume."""
         body: dict[str, Any] = {"name": name, "driver": driver}
         if labels:
             body["labels"] = labels
-        try:
-            resp = await client.post(url, json=body, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+        if driver_opts:
+            body["driverOpts"] = driver_opts
+        return await api("POST", f"{env_path(env_id)}/volumes", json_body=body)
 
-    @mcp.tool()
-    async def inspect_volume(name: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Inspect a volume by name."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    # ── File browsing (read-only) ──
 
-    @mcp.tool()
-    async def remove_volume(
-        name: str, force: bool = False, env_id: str = "0",
-        agent_token: str | None = None,
+    @tool(ToolClass.READ)
+    async def browse_volume(name: str, env_id: EnvId = None) -> Any:
+        """File tree of a volume (first 500 entries)."""
+        data = await api("GET", f"{env_path(env_id)}/volumes/{seg(name)}/workspace")
+        if isinstance(data, dict) and isinstance(data.get("files"), list) and len(data["files"]) > MAX_TREE_ENTRIES:
+            total = len(data["files"])
+            data = {**data, "files": data["files"][:MAX_TREE_ENTRIES], "truncated_from": total}
+        return data
+
+    @tool(ToolClass.READ)
+    async def read_volume_file(
+        name: str,
+        relative_path: Annotated[str, Field(description="Path relative to the volume root, e.g. 'config/app.yml'.")],
+        env_id: EnvId = None,
     ) -> Any:
-        """Remove a volume by name. Destructive; requires confirmation token."""
-        token = get_token_store().create(
-            action="remove_volume",
-            target=f"volume:{name}",
-            endpoint=f"/api/environments/{env_id}/volumes/{name}",
-            method="DELETE",
-            body={"force": str(force).lower()},
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
-        )
-        op_hash = compute_operation_hash("remove_volume", name, {"force": str(force).lower()}, None)
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": f"volume:{name}",
-            "action": "remove_volume",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
+        """Read a text file inside a volume. May contain secrets: summarize rather than repeat them."""
+        return await api("GET", f"{env_path(env_id)}/volumes/{seg(name)}/workspace/file", params={"relativePath": relative_path})
 
-    @mcp.tool()
-    async def prune_volumes(env_id: str = "0", agent_token: str | None = None, dry_run: bool = True) -> Any:
-        """Prune unused Docker volumes. Destructive; use dry_run=False and confirm to execute."""
-        if dry_run:
-            return {
-                "dry_run": True,
-                "warning": "Dry-run. Set dry_run=False and confirm to execute.",
-                "action": "prune_volumes",
-                "target": "all",
-            }
-        token = get_token_store().create(
-            action="prune_volumes",
-            target="all",
-            endpoint=f"/api/environments/{env_id}/volumes/prune",
-            method="POST",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
-        )
-        op_hash = compute_operation_hash("prune_volumes", "all", None, None)
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": "all",
-            "action": "prune_volumes",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
+    # ── Backups ──
 
-    # ── Volume counts & sizes ──────────────────────────────────────────────
+    @tool(ToolClass.READ)
+    async def list_volume_backups(name: str, env_id: EnvId = None, search: Search = None, start: Start = 0, limit: Limit = 50) -> Any:
+        """Backups of a volume."""
+        return await api("GET", f"{env_path(env_id)}/volumes/{seg(name)}/backups", params=page(search, start, limit))
 
-    @mcp.tool()
-    async def get_volume_counts(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get volume counts for the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/counts"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.READ)
+    async def list_backup_files(backup_id: str, env_id: EnvId = None) -> Any:
+        """Files contained in a volume backup."""
+        return await api("GET", f"{env_path(env_id)}/volumes/backups/{seg(backup_id)}/files")
 
-    @mcp.tool()
-    async def get_volume_sizes(env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get volume sizes for the given environment."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/sizes"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.WRITE)
+    async def create_volume_backup(name: str, env_id: EnvId = None) -> Any:
+        """Back up a volume to Arcane's default backup destination."""
+        return await api("POST", f"{env_path(env_id)}/volumes/{seg(name)}/backups")
 
-    @mcp.tool()
-    async def get_volume_usage(name: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Get disk usage for a specific volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/usage"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.DESTRUCTIVE)
+    async def restore_volume_backup(name: str, backup_id: str, env_id: EnvId = None) -> Any:
+        """Propose restoring a backup over a volume (current contents are replaced). Requires confirm_operation."""
+        env = resolve_env(env_id)
 
-    # ── Volume backups ─────────────────────────────────────────────────────
+        async def run() -> Any:
+            return await api("POST", f"{env_path(env)}/volumes/{seg(name)}/backups/{seg(backup_id)}/restore")
 
-    @mcp.tool()
-    async def list_volume_backups(name: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """List all backups for a volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/backups"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def create_volume_backup(name: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Create a new backup of a volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/backups"
-        try:
-            resp = await client.post(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def restore_volume_backup(
-        volume_name: str, backup_id: str, env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Restore a volume backup. Destructive; requires confirmation token."""
-        token = get_token_store().create(
+        return propose(
             action="restore_volume_backup",
-            target=f"volume:{volume_name}/backup:{backup_id}",
-            endpoint=f"/api/environments/{env_id}/volumes/{volume_name}/backups/{backup_id}/restore",
-            method="POST",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+            target=f"volume:{name}",
+            env_id=env,
+            args={"backup_id": backup_id},
+            executor=run,
+            summary=f"Restore backup {backup_id} into volume {name}, overwriting its current contents",
         )
-        op_hash = compute_operation_hash("restore_volume_backup", volume_name, None, None)
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": f"volume:{volume_name}/backup:{backup_id}",
-            "action": "restore_volume_backup",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
 
-    @mcp.tool()
-    async def delete_volume_backup(
-        backup_id: str, env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Delete a volume backup. Destructive; requires confirmation token."""
-        token = get_token_store().create(
+    @tool(ToolClass.DESTRUCTIVE)
+    async def delete_volume_backup(backup_id: str, env_id: EnvId = None) -> Any:
+        """Propose deleting a volume backup. Requires confirm_operation."""
+        env = resolve_env(env_id)
+
+        async def run() -> Any:
+            return await api("DELETE", f"{env_path(env)}/volumes/backups/{seg(backup_id)}")
+
+        return propose(
             action="delete_volume_backup",
             target=f"backup:{backup_id}",
-            endpoint=f"/api/environments/{env_id}/volumes/backups/{backup_id}",
-            method="DELETE",
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+            env_id=env,
+            args={},
+            executor=run,
+            summary=f"Delete volume backup {backup_id}",
         )
-        op_hash = compute_operation_hash("delete_volume_backup", backup_id, None, None)
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": f"backup:{backup_id}",
-            "action": "delete_volume_backup",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
 
-    @mcp.tool()
-    async def download_volume_backup(backup_id: str, env_id: str = "0", agent_token: str | None = None) -> Any:
-        """Download a volume backup."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/backups/{backup_id}/download"
-        try:
-            resp = await client.get(url, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
+    @tool(ToolClass.DESTRUCTIVE)
+    async def remove_volume(name: str, force: bool = False, env_id: EnvId = None) -> Any:
+        """Propose removing a volume and ALL its data. Requires confirm_operation."""
+        env = resolve_env(env_id)
+        usage = await api("GET", f"{env_path(env)}/volumes/{seg(name)}/usage")
 
-    # ── Volume file browser ────────────────────────────────────────────────
+        async def run() -> Any:
+            return await api("DELETE", f"{env_path(env)}/volumes/{seg(name)}", params={"force": force})
 
-    @mcp.tool()
-    async def browse_volume(
-        name: str, path: str = "/", env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """List files and directories at a path inside a volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/browse"
-        params = {"path": path}
-        try:
-            resp = await client.get(url, params=params, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def read_volume_file(
-        name: str, path: str, env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Read the contents of a file inside a volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/browse/content"
-        params = {"path": path}
-        try:
-            resp = await client.get(url, params=params, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            result = resp.json()
-            return {
-                "classification": ToolClass.CREDENTIAL_SENSITIVE,
-                "warning": "This response may contain sensitive data (env vars, secrets, config). Handle with care.",
-                "data": result,
-            }
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def create_volume_directory(
-        name: str, path: str, env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Create a directory inside a volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/browse/mkdir"
-        body = {"path": path}
-        try:
-            resp = await client.post(url, json=body, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def upload_to_volume(
-        name: str, path: str, content: str, env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Upload a file to a path inside a volume."""
-        client = require_client()
-        url = f"/api/environments/{env_id}/volumes/{name}/browse/upload"
-        body = {"path": path, "content": content}
-        try:
-            resp = await client.post(url, json=body, headers=_build_headers(agent_token))
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTP %s on %s: %s", resp.status_code, url, resp.text)
-            return {"error": str(e), "status_code": resp.status_code, "detail": resp.text}
-        except Exception as e:
-            logger.exception("Unexpected error on %s", url)
-            return {"error": str(e)}
-
-    @mcp.tool()
-    async def delete_volume_file(
-        name: str, path: str, env_id: str = "0",
-        agent_token: str | None = None,
-    ) -> Any:
-        """Delete a file or directory inside a volume. Destructive; requires confirmation token."""
-        token = get_token_store().create(
-            action="delete_volume_file",
-            target=f"volume:{name}:{path}",
-            endpoint=f"/api/environments/{env_id}/volumes/{name}/browse",
-            method="DELETE",
-            params={"path": path},
-            classification=ToolClass.DESTRUCTIVE_WRITE,
-            env_id=env_id,
-            agent_token=agent_token,
+        return propose(
+            action="remove_volume",
+            target=f"volume:{name}",
+            env_id=env,
+            args={"force": force},
+            executor=run,
+            summary=f"Permanently delete volume {name} and all of its data" + (" (force)" if force else ""),
+            details={"usage": usage},
         )
-        op_hash = compute_operation_hash("delete_volume_file", f"{name}:{path}", None, {"path": path})
-        return {
-            "warning": "Destructive operation. Call confirm_operation(token=...) to proceed.",
-            "confirmation_token": token,
-            "operation_hash": op_hash,
-            "target": f"volume:{name}:{path}",
-            "action": "delete_volume_file",
-            "classification": ToolClass.DESTRUCTIVE_WRITE,
-        }
+
+    @tool(ToolClass.DESTRUCTIVE)
+    async def prune_volumes(env_id: EnvId = None) -> Any:
+        """Propose pruning unused anonymous volumes (named volumes are kept). Returns a preview and a token."""
+        env = resolve_env(env_id)
+        data = await api("GET", f"{env_path(env)}/volumes", params={"inUse": False, "start": 0, "limit": 500})
+        items = data.get("items", []) if isinstance(data, dict) else data or []
+        preview = [v.get("name") for v in items if isinstance(v, dict)]
+
+        async def run() -> Any:
+            return await api("POST", f"{env_path(env)}/volumes/prune")
+
+        return propose(
+            action="prune_volumes",
+            target="volumes:unused",
+            env_id=env,
+            args={},
+            executor=run,
+            summary=f"Prune unused anonymous volumes ({len(preview)} unused volume(s) exist; Docker only removes the anonymous ones)",
+            details={"unused_volumes": preview[:100], "unused_count": len(preview)},
+        )

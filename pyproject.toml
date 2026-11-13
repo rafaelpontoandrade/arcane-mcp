@@ -7,12 +7,12 @@ packages = ["src/arcane_mcp"]
 
 [project]
 name = "arcane-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "MCP server for Docker management via the Arcane API"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-keywords = ["mcp", "arcane", "docker", "opencode"]
+keywords = ["mcp", "arcane", "docker", "homelab"]
 authors = [
     { name = "splaq" },
 ]
@@ -23,11 +23,13 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "fastmcp>=3.3.1",
     "httpx",
     "python-dotenv",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +52,10 @@ ignore = ["B904"]  # raise-within-try is intentional for MCP error pattern
 [tool.ruff.format]
 quote-style = "double"
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
@@ -59,7 +65,7 @@ disable_error_code = ["type-arg"]
 
 [project.urls]
 Homepage = "https://github.com/getarcaneapp/arcane"
-Repository = "https://github.com/splaq/arcane-mcp"
+Repository = "https://github.com/rafaelpontoandrade/arcane-mcp"
 
 [project.scripts]
 arcane-mcp = "arcane_mcp.server:main"
